@@ -1,0 +1,909 @@
+\pdfoutput=1
+
+\documentclass{l4proj}
+\usepackage{listings}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{lscape}
+\usepackage{subfig}
+\usepackage{bytefield}
+\usepackage{cite}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage[demo]{rotating}
+\usepackage{lscape}
+
+%
+% put any packages here
+%
+
+\begin{document}
+% Define Language
+\lstdefinelanguage{ebpfAsm}
+{
+  % list of keywords
+  morekeywords={
+    add,sub,mul,div,or,and,lsh,rsh,neg,mod,xor,mov,arsh,add32,sub32,mul32,div32,
+    or32,and32,lsh32,rsh32,neg32,mod32,xor32,mov32,arsh32,le16,le32,le64,be16,
+    be32,be64,lddw,ldabsw,ldabsh,ldabsb,ldabsdw,ldindw,ldindh,ldindb,ldinddw,
+    ldxw,ldxb,ldxh,ldxdw,stw,sth,stb,stdw,stxh,stxw,stxb,stxdw,ja,jeq,jgt,jge,
+    jset,jne,jsgt,jsge,call,exit,jneq,ld,ldx,ret,ldb,ldind, ldh, tax
+  },
+  sensitive=false, % keywords are not case-sensitive
+  morecomment=[l]{;}, % l is for line comment
+  morecomment=[s]{/*}{*/}, % s is for start and end delimiter
+  morestring=[b]" % defines that strings are enclosed in double quotes
+}
+
+\title{FPGA implementation of the (extended) Berkeley Packet Filter (BPF)}
+\author{Aleksandar Ilov}
+\date{March 21, 2017}
+\maketitle
+
+\begin{abstract}
+In 1992, McCane and Jacobson defined the BPF instruction set [1], a small set of instructions designed for register machines to quickly filter packets within the UNIX kernel. As of today, it shows no signs of deprecation due to its widespread implementation within operating systems (Linux, UNIX, NetBSD, FreeBSD, Solaris) and tools (libpcap, tcpdump, wireshark).\\
+This project aims to offload the BPF filtering logic from software to hardware, and implement the BPF instruction set in hardware platforms such as the NetFPGA-10G to provide high-speed execution of BPF filters.\\
+First, we present background information on the Berkeley Packet Filer, the BPF ecosystem and applications and motivation for implementing it in hardware.\\
+We go through the process of investigating a platform-suitable approach to implementing the eBPF instruction set and then coming up with a simulation model.\\
+Then we evaluate the performance and complexity of the machine able to execute this instruction set, provide estimates on the number of collocated machines a single FPGA can host and suggest a way to implement it as part of the NetFPGA pipeline.\\
+In conclusion, we exame how the final model fits with the platform and whether it achieves the original goal of the project.
+\end{abstract}
+
+\educationalconsent
+%
+%NOTE: if you include the educationalconsent (above) and your project is graded an A then
+%      it may be entered in the CS Hall of Fame
+%
+\tableofcontents
+%==============================================================================
+
+\chapter{Introduction}
+\pagenumbering{arabic}
+
+\section{The Berkeley Packet Filter}
+The Berkeley Packet Filter (BPF) provides a raw interface for filtering packets at the Data Link layer (L2). It is available on most Unix-like operating systems.\\
+It provides a convenient mechanism to filter packets, by permitting a user space process to supply a filter program that specifies which packets it wants to receive. For an instance, a process may only want to receive packets that initiate a TCP connection. In that case, the process can supply a filter which drops unwanted packets. BPF only returns packets that pass the filter that the process supplies. Thus, it avoids copying unwanted packets from the operating system kernel to the process, which is a great performance improvement.\\\\
+In a networking stack, BPF can be described as the filtering mechanism at a given network interface. And indeed, this is the definition that applies to our proposed hardware implementation.\\
+A practical example is Linux, where an alternative raw interface to the data link layer is provided, but BPF is still used to supply a filtering mechanism to that raw interface.\\\\
+BPF has been widely used for decades now. The original paper, and de-facto introduction, of the Berkeley Packet Filter was written by Steven McCanne and Van Jacobson back in 1992 while at Lawrence Berkeley Laboratory[1]. Even today, it is still an integral part of Linux's networking stack.\\
+Being able to process packets in the kernel, BPF has become the universal packet filtering API. It is the backbone of de-facto standard network debugging tools, like \textbf{libpcap} and \textbf{tcpdump}.\\
+A good example of BPF usage in the field is Cloudflare. Since the company deals with massive sophisticated packet flooding on a daily basis, simple iptables filtering does not work well enough. Thus, their data centres are using custom crafted BPF filters to filter out unwanted traffic [2].\\\\
+The original BPF architecture was later extended into a more modern RISC architecture, knows as "extended BPF" (eBPF). eBPF is backwards compatible with original BPF and thus we use the two names interchangeably when it comes to features relevant to both. However, eBPF is the focus of our hardware implementation in terms of architecture and instruction set.
+
+\section{Project motivation and related work}
+The eBPF instruction set is simple and general, designed for protocol independence and fast execution. Since it is already the backbone of quite a few network filtering tools, it is worth exploring how it could benefit from a hardware implementation. Such an implementation may already find application in a number of domains.\\\\
+S. Jouet et al [3] present an alternative fully flexible match structure for OpenFlow, which aims to improve the matching capabilities of the protocol, which is currently a bottleneck in the advancement of Software Defined Networking (SDN). This alternative structure relies on BPF for packet classification at the switches instead of matching at the Openflow controller. Since BPF is protocol-independent, general RISC architecture, it allows the matching execution to benefit from hardware acceleration, using ASICs or FPGAs [3]. This way, we would still have the control plane specifying the matching, while the execution is left to be optimized by the platform.\\\\
+Another relevant project is BPFabric [4]. It leverages eBPF as a platform and protocol independent instruction set to define the packet processing and forwarding functionality of the data plane. It presents a control plane API for deploying functions on-the-fly.\\
+By expressing a switch's data plane function in a high level language, later compiled to eBPF, it aims to cover not only routing and forwarding, but also functions such as load balancing and encryption. The hardware to implement that could range from a traditional switch to an FPGA.\\
+The BPFabric platform includes an "agent" either on the hardware switch side or the controller side, which receives the data plane function and then compiles it to eBPF bytecode.\\\\
+In this project, we aim to provide a hardware implementation of eBPF, which would fit within these use cases. In addition to the practical benefit of having such an implementation working, we try to explore eBPF's suitability for high-performance data plane filtering even further.
+
+
+\chapter{Background}
+\section{BPF filtering}
+BPF's filtering capabilities are implemented as an interpreter for a machine language for the BPF VM.\\
+A program written in BPF machine language can fetch packet data, do arithmetic, comparisons on constants or packet data and do bit-wise tests on the results. Based on a test, it can either accept or reject packets.\\
+Filters can be attached to a network socket in order to start filtering packets coming in. Once attached, a filter can also be detached while the socket is still open, or as soon as the socket is closed.\\
+Moreover, with BPF, multiple filters can be attached on the same socket or one filter can be easily replaced with another assuming the new one passes the kernel checks [5].\\\\
+There also exists an option for "locking" filters on a socket. Once locked, a filter cannot be removed or changed. This allows one process to setup a socket, attach a filter, lock it then drop privileges and be assured that the filter will be kept until the socket is closed.\\
+Such construct is widely used by libpcap. To illustrate the process, a high-level filter command, such as "tcpdump -i em1 port22" passes through the libpcap internal compiler that generates a structure that can eventually be loaded via SO\_ATTACH\_FILTER to the kernel [5].\\
+Aside from the example of placing filters on sockets, BPF finds other usage on Linux just as well. For example, \textbf{xt\_bpf} for \textbf{netfilter}, \textbf{cls\_bpf} in the kernel qdisc layer or PTP code [5].\\\\
+An advantage of using BPF filtering over a regular C program is its safety. Kernel checks are done before "attaching" filters and ensure the following bytecode properties:
+\begin{itemize}
+    \item Jumps are only forward, which guarantees that there aren't any loops in the BPF program. Therefore it must terminate.
+    \item All instructions, especially memory reads are valid and within range.
+    \item The single BPF program has less than 4096 instructions.
+\end{itemize}
+The above renders BPF programs not Turing complete.
+\\\\
+As explained above, BPF allows a user-space program to attach a filter onto any socket and allow or disallow certain types of data to come through the socket. What is more, it achieves that in a platform-independent manner and avoids the overhead of copying packet data between kernel and user space.\\\\
+The following example shows a filter written in the BPF assembly-like language. It matches a DNS query for "www.example.com" and drops the packet on a successful match [2]:
+\begin{lstlisting}[language=ebpfAsm]
+    ; load constant into A
+    ld #20
+    ; (lower nibble of packet << 2) into X
+    ldx 4*([0]&0xf)
+    ; A = A + X
+    add x
+    ; X = A
+    tax
+
+lb_0:
+    ; Match: 076578616d706c6503636f6d00 '\x07example\x03com\x00'
+    ld [x + 0]
+    jneq #0x07657861, lb_1
+    ld [x + 4]
+    jneq #0x6d706c65, lb_1
+    ld [x + 8]
+    jneq #0x03636f6d, lb_1
+    ldb [x + 12]
+    jneq #0x00, lb_1
+    
+    ; drop
+    ret #1
+
+lb_1:
+    ret #0
+\end{lstlisting}
+
+\section{The BPF engine and instruction set}
+As shown in the previous section, BPF filters can be written in an assembly-like language. Later assembled to bytecode, which is then interpretable to support filtering.\\
+The original (classic) BPF defines a register machine architecture containing the following:
+\begin{itemize}
+    \item 32-bit wide accumulator
+    \item 32-bit wide general purpose register
+    \item 16 32-bit wide registers which are to be used as "scratch memory"
+\end{itemize}
+When assembled into opcodes, a BPF program is essentially an array of 64-bit double words. These contain:
+\begin{itemize}
+    \item 16-bit opcode
+    \item 8-bit jump (true) target
+    \item 8-bit jump (false) target
+    \item 32-bit "miscellaneous" argument, that is interpreted differently depending on the opcode
+\end{itemize}
+The instruction set is very general and includes load, store, branch, alu, misc and return instructions with a total of 10 addressing modes.\\\\
+An important detail of original BPF is that it makes use of extensions in the "LOAD" class of instructions [5]. These involve overloading the miscellaneous k argument with a negative offset + an extension offset with results loaded into the accumulator. Such extensions were later incorporated into the extended BPF (eBPF).\\
+Some of these possible extensions include accessing fields of a socket buffer (skb) struct, such as length, protocol or type, or fetching the payload start offset.\\\\
+A simple example of using extensions is the following filter for ARP packets. It "looks" at the EtherType of the Ethernet frame header, which is "0x806" for an ARP payload.
+\begin{lstlisting}[language=ebpfAsm]
+    ldh [12]
+    jne #0x806, drop
+    ret #-1
+    
+  drop: 
+    ret #0
+\end{lstlisting}
+A mainstream tool, such as "tcpdump", works by parsing a readable expression, such as "ip and udp and port 53", turning it into BPF bytecode which is then attached to a network interface.
+
+\section{The extended BPF (eBPF)}
+Since version 3.18, the Linux kernel includes an extended BPF virtual machine, known as "Extended BPF", "eBPF" or also "Internal BPF". It has a slightly different instruction set to be used by the kernel interpreter. The instruction set is modelled with JIT in mind and close to modern architectures, such as x86\_64. In fact, the original idea was to have a C dialect which would compile into eBPF bytecode, then be just-in-time mapped to modern 64-bit CPUs.\\\\
+eBPF is already well integrated with the Linux kernel. In kernel version 3.19, eBPF filters were made attachable to sockets [6][7]. In kernel version 4.1, these filters were extended further to be attachable to traffic control classifiers [8]. What is more, eBPF can also be used for non-networking purposes. For example, for attaching eBPF programs to various tracepoints [9][10][11].\\
+Currently, the classic BPF is being used for JITing on most architectures, while x86-64, arch64 and s390x perform JIT compilation from eBPF. However, the idea is to migrate other JIT compiler to eBPF in the future.\\\\
+In this project, we pick eBPF for a hardware implementation as it is a modern and well-established solution for in-kernel packet filtering. What is more, the instruction set is flexible and simple enough and lends itself to an FPGA-implemented pipeline.\\
+Moreover, it is a direct improvement over the original BPF instruction set, which has an accumulator-based architecture and instruction overload semantics instead of generic load instructions.
+
+\section{eBPF Instruction set and architecture}
+The eBPF architecture differs from the original BPF by having 10 internal 64-bit registers and a read-only frame pointer. Since 64-bit CPUs are passing arguments to functions via registers, the number of arguments from an eBPF program to in-kernel function is restricted to 5 and one register is used to accept return value from an in-kernel function. Thus, the in-kernel eBPF calling convention is as follows:
+\begin{itemize}
+    \item R0 : return value from in-kernel function, and exit value for eBPF program (scratched across calls)
+    \item R1 - R5 : arguments from eBPF program to in-kernel function (scratched across calls)
+    \item R6 - R9 : callee saved registers that in-kernel function will preserve
+    \item R10 : read-only frame pointer to access stack
+\end{itemize}
+Thus, all the eBPF internal registers map 1-to-1 to hardware registers in architectures such as x86\_64. Moreover, the eBPF calling convention maps directly to ABIs used by the kernel on 64-bit architectures.\\
+In the case of 32-bit architectures, the JIT may map programs that use only 32-bit arithmetic. The instruction set includes a set of 32-bit ALU instructions, as described later. These utilize the 32-bit subregisters which are the lower "half" of the 64-bit internal registers. Reads and writes in 32-bit zero-extend the "upper" 32 bits. This definition maps directly to the x86\_64 and arm64 subregisters.\\
+32-bit architectures can still run 64-bit internal BPF programs via an interpreter. Alternatively, any 32-bit subregister instructions are mapped directly to the native instruction set while only the rest is interpreted.\\\\
+eBPF also replaces conditional jump targets with a jump true fall-through and introduces a CALL instruction, which uses the register passing convention for low overhead calls to/from other kernel functions. In short, before an in-kernel function call, the BPF program needs to have function arguments placed into R1-R5 registers. If we have these registers mapped to hardware ones (depending on the architecture), a BPF call is just JIT-ed to a hardware CALL, which introduces no performance penalties.\\
+After the in-kernel function call, return value is put into R0 and R1-R5 are scratched, marked "unreadable". Note that registers R6-R9 are callee saved and their state is preserved across the call.\\\\
+An example mapping of eBPF registers to x86\_64 is as follows:
+\begin{center}
+\begin{tabular}{ |c|c| } 
+ \hline
+ eBPF & x86\_64 \\ 
+  \hline
+   R0 & rax \\
+   R1 & rdi \\
+   R2 & rsi \\
+   R3 & rdx \\
+   R4 & rcx \\
+   R5 & r8 \\
+   R6 & rbx \\
+   R7 & r13 \\
+   R8 & r14 \\
+   R9 & r15 \\
+   R10 & rbp \\
+ \hline
+\end{tabular}
+\end{center}
+eBPF is a general purpose RISC instruction set. Just like the original BPF, eBPF runs within a controlled environment, is deterministic and the kernel can easily prove that. The safety of the program can be determined in two steps: first step does depth-first-search to disallow loops and other control flow graph validation. The second step starts from the first instruction and descends all possible paths. It simulates execution of every instruction and observes the state change of registers and stack [5].
+
+\subsection{Encoding and instruction format}
+An eBPF program is essentially a sequence of 64-bit instructions. Every instruction has the same basic encoding:
+\begin{itemize}
+    \item 8 bit opcode
+    \item 4 bit destination register
+    \item 4 bit source register 
+    \item 16 bit offset
+    \item 32 bit immediate
+\end{itemize}
+The following picture shows this encoding, assuming host byte order:\\
+%\includegraphics[scale=0.9]{encoding.JPG}
+\begin{center}
+\begin{bytefield}{32}
+  \bitbox{32}{imm}\\
+  \bitbox{16}{off} & \bitbox{4}{src} & \bitbox{4}{dst} & \bitbox{8}{opcode}\\
+  \bitheader[b]{31, 15, 11, 7, 0}
+\end{bytefield}
+\end{center}
+Note that most instructions do not use all fields. Unused fields are zeroed out.\\\\
+This simple structure allows for a well-defined decoding stage. In fact, an eBPF instruction decoder simply masks out the 5 different fields, examines the opcode for the exact instruction and further uses some of the remaining fields accordingly.\\
+As \textbf{imm} and \textbf{off} are just raw values, they can be used directly. The \textbf{src} and \textbf{dst} fields are essentially indexes (addresses) to registers.\\\\
+As explained above, an essential and first step to decoding is the opcode. The low 3 bits of the opcode field are the "instruction class". This is used for grouping together related opcodes. For example:\\\\
+Memory instructions use the following opcode structure:\\
+%\includegraphics[scale=0.9]{mem_op_encoding.JPG}
+\begin{center}
+\begin{bytefield}{8}
+  \bitheader[b]{7, 4, 2, 0}\\
+  \bitbox{3}{mde} & \bitbox{2}{sz} & \bitbox{3}{cls}
+\end{bytefield}
+\end{center}
+\begin{itemize}
+    \item mde : Memory access mode. eBPF only supports the generic MEM access mode.
+    \item sz  : Size of the memory location
+    \item cls : Class
+\end{itemize}
+Thus, a memory instruction is further decoded by masking out its class and memory size. These are parameters, which could be fed into a memory block.\\\\
+ALU and branching instructions have the following opcode structure:\\
+%\includegraphics[scale=0.9]{alu_op_encoding.JPG}
+\begin{center}
+\begin{bytefield}{8}
+  \bitheader[b]{7, 3, 2, 0}\\
+  \bitbox{4}{op} & \bitbox{1}{s} & \bitbox{3}{cls}
+\end{bytefield}
+\end{center}
+\begin{itemize}
+    \item op  : Operation
+    \item s   : Source
+    \item cls : Instruction class
+\end{itemize}
+Here, if the s bit is zero, then the source operand is imm. If s is one, then the source operand is src. The op field specifies which ALU or branch operation is to be performed.\\
+Similarly to the memory instruction example, these are masked out and used as parameters. The \textbf{s} field can be viewed as a control signal picking either \textbf{imm} or \textbf{src}.\\
+\begin{center}
+Full encoding of "ADD R1, R2":\\
+\vspace{1em}
+\begin{bytefield}[bitwidth=0.7em]{64}
+\bitheader[b]{63, 31, 15, 11, 7, 0}\\
+\bitbox{64}{0x000000000000210f \\ \tiny add r1, r2} \\
+\bitbox{32}{0x00000000 \\ \tiny imm} &
+\bitbox{16}{0x0000 \\ \tiny off} &
+\bitbox{4}{0x2 \\ \tiny src} &
+\bitbox{4}{0x1 \\ \tiny dst} &
+\bitbox{8}{0x0f \\ \tiny op} \\
+\bitbox{32}{0x00000000 \\ \tiny imm} &
+\bitbox{16}{0x0000 \\ \tiny off} &
+\bitbox{4}{0x2 \\ \tiny src} &
+\bitbox{4}{0x1 \\ \tiny dst} &
+\bitbox{4}{0x0 \\ \tiny op} &
+\bitbox{1}{1 \\ \tiny s} &
+\bitbox{3}{111 \\ \tiny cls}\\
+\end{bytefield}
+Full encoding of "STW [R1 + \#0x2F], \#0x1E2FF":\\
+\vspace{1em}
+\begin{bytefield}[bitwidth=0.7em]{64}
+\bitheader[b]{63, 31, 15, 11, 7, 0}\\
+\bitbox{64}{0x0001e2ff002f0162 \\ \tiny stw [r1+\#0x2f], \#0x1e2ff} \\
+\bitbox{32}{0x0001e2ff \\ \tiny imm} &
+\bitbox{16}{0x002f \\ \tiny off} &
+\bitbox{4}{0x0 \\ \tiny src} &
+\bitbox{4}{0x1 \\ \tiny dst} &
+\bitbox{8}{0x62 \\ \tiny op} \\
+\bitbox{32}{0x0001e2ff \\ \tiny imm} &
+\bitbox{16}{0x002f \\ \tiny off} &
+\bitbox{4}{0x0 \\ \tiny src} &
+\bitbox{4}{0x1 \\ \tiny dst} &
+\bitbox{3}{011 \\ \tiny mde} & 
+\bitbox{2}{00 \\ \tiny sz} &
+\bitbox{3}{010 \\ \tiny cls}\\
+\end{bytefield}
+\end{center}
+This simple structure highlight eBPF as a good choice for a hardware implementation. A clear advantage over classic BPF is the lack of overloading instruction operators, which is a "bootstrapped" way of extending the instruction set. Instead, we have a well-defined clear structure that results in straightforward decoding.\\
+A descriptive listing of the entire eBPF instruction set is available at\\ https://github.com/iovisor/bpf-docs/blob/master/eBPF.md.\\
+
+\subsection{Direct packet access}
+An important characteristic of eBPF are packet access instructions. The instruction set has two non-generic instructions for accessing packet data directly, namely BPF\_ABS and BPF\_IND.\\
+In the case of the in-kernel implementation, they can only be used when the interpreter context points to a socket buffer struct. There are seven implicit operands:
+\begin{enumerate}
+    \item Register R6 is an implicit input that must contain pointer to a socket buffer.
+    \item Register R0 is an implicit output which contains the data fetched from the packet.
+    \item Registers R1-R5 are scratch registers and must not be used to store the data across packet access instructions.
+\end{enumerate}
+% how do we translate this to HW ??? talk about advantages of the below ???
+\textbf{BPF\_IND} does a load at (imm + src) off the start of the data segment of the packet. That is:
+\begin{lstlisting}
+  R0 = ntohl(*(u32 *) (((struct sk_buff *) R6)->data + src_reg + imm32))
+\end{lstlisting}
+And R1 - R5 are scratched.\\\\
+\textbf{BPF\_ABS} does an "absolute" load at the offset specified by the immediate value (imm). That is:
+\begin{lstlisting}
+  R0 = ntohl(*(u32 *) (((struct sk_buff *) R6)->data + src_reg))
+\end{lstlisting}
+Moreover, packet access instructions have implicit program exit condition as well. When eBPF program is trying to access the data beyond the packet boundary, the interpreter will abort the execution of the program. This is a feature which complements BPF's list of advantages with safety.\\\\
+The packet access procedure described above is Linux kernel specific. In the case of our hardware implementation, regardless of the exact architecture, direct packet access is essentially a memory access.\\
+We can view the socket buffer's data field as the memory where an inbound packet is buffered. Thus, we simply supply the immediate and src register values to that memory as parameters for a \textbf{READ} operation.
+
+\section{The NetFPGA platform}
+Our platform of choice is the NetFPGA-10G. It is an open source hardware and software platform designed for research and teaching. It is specifically designed to allow development of high-speed, hardware-accelerated networking system prototypes.\\\\
+The 10G is an FPGA-based PCIe board with 10-Gigabit SFP+ interface, a x8 gen1 PCIe adapter card incorporating the Xilinx Virtex-5 TX240T FPGA.\\
+The board offers a 10-Gigabit Ethernet networking ports, 4 SFP+ connectors connected to the FPGA through four Broadcom’s AEL2005 PHY devices. These can work in either 10-Gigabit or 1-Gigabit mode. Additionally, quad data rate SRAM, which is suitable for storing and forwarding table data, reduced latency DRAM for packet buffering.\\
+The Xilinx Virtex-5 TX240T is fully user-programmable and offers 240k logic cells with 11,664 Kbit block RAM and up to 2,400 Kbit distributed RAM.\\\\
+The 10G offers a great test bed for a hardware eBPF implementation, which can later be transferred to a mainstream networked device. The Virtex-5 has more than enough fabric space for a processing unit that works on the simple eBPF instruction set. What is more, it is rated at 550 MHz (theoretical) maximum clock speed. Thus, a prototype could be evaluated in terms of speed, space demand and implementation complexity.\\
+Finally, it offers a straightforward pipeline utilized by a range of example projects that have already been implemented and are open-sourced. These include learning switches and various routers, available in the NetFPGA github repository [13].
+
+ 
+
+\chapter{Design and implementation}
+\section{A software implementation "eBPF-VM"}
+During the "exploration" stage of the project, a software emulator was developed to simulate a possible implementation of an eBPF engine. The goal being exploring the instruction set further and producing a high-level pseudo version of our hardware implementation.\\
+The tool, named "eBPF\_VM" is written in C++ for Linux and comes with a very simple assembler for BPF assembly programs. It is a simpler version of the \textbf{bpf\_asm} tool present under \textbf{tools/net/} in the Linux kernel source directory. Although far from robust, it gives implements most of the instruction decoding and execution logic.\\It operates in the following sequence, following the standard Fetch-Decode-Execute pattern:
+\begin{enumerate}
+    \item Assemble: Parse a ".bpf" eBPF assembly source file. Byte code is emitted into a vector of 64-bit double words.
+    \item Fetch: Fetch instruction byte code.
+    \item Decode: Mask out relevant bit patterns and set up virtual registers.
+    \item Evaluate: Evaluate decoded instruction. Data is stored into virtual storage (array).
+    \item Repeat: Go back to Fetch until end of program or a "RET" instruction is encountered.
+\end{enumerate}
+The software implementation purposely ignored specific instructions. Such an instruction is "CALL", which is used for calling in-kernel functions. In the case of our pursued hardware implementation, the "CALL" instruction is only intended for table calls and consulting the "upper-level" when no decision can be made on packet routing. This is explained in more detail later in the report.\\
+It also does not support packet data access since that is not available in software. To "bootstrap" that, a single 64-bit word can be hard-coded as packet data.\\\\
+To showcase the tool, we load the following BPF program, which does a simple addition of 2 register values and compares the result, which leads to branching.
+\begin{lstlisting}[language=ebpfAsm]
+    ; load constants into registers
+    lddw r2, #0x4
+    lddw r3, #0x6
+    lddw r4, #0xa
+    
+    ; 0x4 + 0x6 = 0xa
+    add r2, r3
+    jeq r2, r4, success
+    
+    ; drop
+    ret #1
+    
+success:
+    ret #0
+\end{lstlisting}
+When ran on the eBPF\_VM, we observe the correct change of internal machine state. That includes the program counter, running state of the machine, result of decoding stage and all current register values. The following figures show the machine state at each of the 6 executed instructions.\\
+\begin{figure}[H]
+  \centering
+  \subfloat[lddw r2, \#0x4]{\label{ref_label1}\includegraphics[width=0.3\textwidth]{ins1.JPG}}
+  \subfloat[lddw r3, \#0x6]{\label{ref_label2}\includegraphics[width=0.3\textwidth]{ins2.JPG}}
+  \subfloat[lddw r4, \#0xa]{\label{ref_label3}\includegraphics[width=0.3\textwidth]{ins3.JPG}}
+\end{figure}
+\begin{figure}[H]
+  \centering
+  \subfloat[add r2, r3]{\label{ref_label4}\includegraphics[width=0.3\textwidth]{ins4.JPG}}
+  \subfloat[jeq r2, r4, success]{\label{ref_label5}\includegraphics[width=0.3\textwidth]{ins5.JPG}}
+  \subfloat[ret \#0]{\label{ref_label6}\includegraphics[width=0.3\textwidth]{ins6.JPG}}
+\end{figure}
+
+\section{Architectural patterns}
+During the initial design stage of the project, different approaches to the hardware implementation were considered. These had to implement the processing engine as close to the in-kernel implementation as practically possible.\\
+These involved implementing the eBPF pipeline using the FPGA fabric as well as processors in various setups, ranging from a soft interpreter for a BPF coprocessor to a fully-functional soft processing unit. Some of the ideas were dropped due to performance concerns, others due to incompatibility with the available NetFPGA platform.
+\subsection{Translator approach}
+\begin{center}
+\includegraphics[scale=0.8]{transarch.pdf}\\
+\end{center}
+One considered approach involved having a traditional CPU running on the physical switch's side. A translator synthesized onto the FPGA fabric would translate the eBPF filter to CPU machine code and essentially offload the packet filtering to the CPU.\\\\
+Such an approach would involve having a dedicated CPU to execute the filter on each switch. Moreover, the whole pipeline would be slow due to the need to translate instructions. Thus, such an architecture was predicted to struggle with achieving line-rate packet filtering. Moreover, using an external general-purpose CPU, such as an ARM CPU, for the filtering would add an extra layer of complexity and is wasteful with poor power utilisation.
+\subsection{Coprocessor}
+\begin{center}
+\includegraphics[scale=0.8]{coprocarch.pdf}\\
+\end{center}
+A more complicated approach would involve having a BPF-specific coprocessor, which shares the load with the main CPU. In that case, a translator is still used to translate eBPF instructions to the main CPU. This is done selectively, depending on the CPU's native instruction set, some instructions are directly translated to native instructions while more clock cycle demanding eBPF instructions are offloaded to the BPF processor. This would require a common system bus with a mechanism to coordinate both processors.\\\\
+While this interesting approach could address some performance issues of the previous architecture, such as lack of 1-to-1 mapping of eBPF to native instructions, it is very complex and introduces even more redundancy and poor utilisation. A thorough analysis would be required on the CPU instruction set and BPF translation complexity. Moreover, having a BPF-to-native translator as well as a BPF-specific soft core is space demanding on the available FPGA fabric.
+\subsection{eBPF soft core}
+\begin{center}
+\includegraphics[scale=0.8]{scarch.pdf}\\
+\end{center}
+The coprocessor idea introduced a BPF-specific processor implemented in the FPGA fabric, also called a "soft core". In order to avoid the above idea's complexity of processor coordination, a logical change is to offload all filtering to such a soft core. Essentially, this would simplify the architecture to a 64-bit soft core which executes eBPF bytecode natively. This soft core would be responsible for executing the filter as well as "signalling" a decision on what to do with the packet.\\\\
+FPGA soft cores are a common and well-explored type of architecture [14][15]. They are a popular choice for implementing custom and traditional RISC instruction sets as part of a SoC [16][17]. Such an architecture is perfect for the purpose of this project as the eBPF instruction set is straightforward to implement. It also introduces standard ways of optimisation such as pipelining and superscaling. Moreover, it fits well with the NetFPGA platform as it only requires replacing the packet pipeline with the soft core. What is more, it allows for a modular implementation since the soft core would only need to interface with NetFPGA modules.\\
+A soft core implementation could also be deployable on networked devices with an FPGA already present and can later be extended to the previous coprocessor approach, if decided.\\
+We elaborate on the concrete design of this architecture in the following section.
+\subsection{Asynchronous cores}
+Less "traditional" approaches were also explored as possible ways to go. One such approach is a non-clocked core, which would function identically to the soft core explained above.\\
+Asynchronous CPUs are an area of active research interest. Essentially, processor stages are coordinated using logic devices called "pipeline controls". In theory, such an approach could be used for the BPF soft core as it implies a high-performance pipeline. Unlike a clocked device, it would not comply with a critical path, which would slow faster instructions/stages.\\\\
+However, there is a lack of resources or example on implementing pipeline controls in FPGA fabric, that is VHDL or Verilog. Moreover, standard design tools do not support working with a fully asynchronous circuit [18]. Thus, it is fair to say that an asynchronous architecture deserves a research project of its own and was decided to be out of scope for this project.
+
+\section{Soft core design and implementation}
+\subsection{Design adjustments}
+The hardware implementation of the eBPF instruction set differs from the Linux or BSD implementations, which were described in the Background section. This implies a number of adjustments and omissions considering the platform and architecture chosen.\\\\
+\textbf{Calling functions} is to be implemented as a way to offload processing to possible external "upper" modules. That would include checksums and table lookups amongst others. Naturally, this is different from in-kernel calls, which are only relevant to end host implementations of eBPF, not on networked devices.\\
+Currently, the CALL instruction is only implemented for program counter testing purposes and can be considered a NOP.\\\\
+\textbf{Division and modulo} operations are omitted due to difficulties with logic synthesis. This compromise was ruled as fair since they are rarely used for filtering. These points on the two ALU instructions are described in more detail in the ALU subsection below, which also depicts the whole module design.\\\\
+\textbf{Byteswapping} instructions were also omitted due to the fact that we target a fully networked device. Thus, there is no need for swapping from little to big endian or vice versa. Big-endian network byte order is assumed. 
+\newpage
+\subsection{Architecture}
+The currently implemented soft core design is capable of carrying out all desired functionality, as specified above. It implements the following architectural diagram.
+\begin{center}
+\includegraphics[scale=0.38]{maindiagram.pdf}\\
+\end{center}
+As a part of a research project, the architecture design aims at simplicity and ease of testing. Thus, various RISC optimisation techniques such as superscaling and pipelining were considered but rejected as too complicated. What is more, BPF filters tend to have a branching structure as they apply multiple masks to pieces of the packet. This would impact a pipelined architecture negatively without any branch prediction in place.\\
+Additionally, all modules of the system were defined with debugging signals and asynchronous resets for easier testing and debugging.
+
+\subsection{Implementation}
+The soft core implementation was realised in Verilog, using the standard Xilinx toolchain: \textbf{Xilinx ISE} and \textbf{ISim}. The \textbf{Icarus Verilog} simulation and synthesis tool was also used for debugging different modules independently.\\
+The whole system was implemented to be modular with the different modules corresponding exactly to the established diagram.\\
+We now look at each of the soft core's modules, giving a more detailed description of its structure and implementation as well as explaining design decisions.
+
+\subsection{Modules}
+\subsubsection{ALU}
+\begin{center}
+\includegraphics[scale=0.75]{aludiagram.pdf}\\
+\end{center}
+We utilize an asynchronous 64-bit ALU design, which implements all ALU instructions of the set in a single clock cycle. In addition to all arithmetic, the ALU also performs logical and arithmetic shifting, as per the instruction set definition.\\
+The 32-bit ALU instructions, which eBPF supports, are essentially treated as 64-bit. The only difference is in the Register Bank read/write which is explained in the Register Bank section. \\
+Moreover, we do comparison in the ALU instead of using an additional comparator/branching module. Since there is no pipelining, the addition of an additional module would require more space and additional interconnects, while the ALU stays idle. Thus, we simply delegate comparison operations to the ALU and "probe" the least significant bit of the output wire to signal branching. That is:
+\begin{itemize}
+    \item 0 - Comparison result is false, do not jump
+    \item 1 - Comparison result is true, perform jump
+\end{itemize}
+The ALU inputs are multiplexed depending on the instruction. The control signals for that are supplied by the control circuit. The current usage of a 2-1 and a 3-1 multiplexers supports all possible ALU operations.\\\\
+An important point is that the current design has division and modulo operations \textbf{disabled}. These are notoriously tough to synthesize as they require inferred divider circuitry. This is indicated by the synthesizer in the Xilinx ISE when trying to synthesize the ALU module with division and modulo enabled:\\
+\begin{center}
+\includegraphics[scale=0.75]{divsyn.JPG}
+\includegraphics[scale=0.75]{modsyn.JPG}
+\end{center}
+In fact, this was ruled to be a fair compromise. Divison and multiplication are a rarely used feature of eBPF as they would require a very specific filtering use case, which would not be satisfied by a bitwise shift.\\
+When division and modulo are disabled, the synthesizer successfully infers the following list of devices onto the FPGA fabric. These are enough for implementing all required ALU operations:
+\begin{center}
+\begin{tabular}{ |c|c| } 
+ \hline
+ \textbf{Device} & \textbf{\#} \\ 
+ \hline
+   64x64-bit multiplier & 1 \\
+   64-bit adder subtractor & 1 \\
+   64-bit comparator equal & 1 \\
+   64-bit comparator greatequal & 2 \\
+   64-bit comparator greater & 2 \\
+   64-bit shifter logical left & 1 \\
+   64-bit shifter logical right & 1 \\
+   64-bit xor2 & 1 \\
+ \hline
+\end{tabular}
+\end{center}
+And indeed, the synthesized ALU successfully executes ALU operatons involving arithmetic, shifting and comparison.\\\\
+The following figures depict the correct operation of ALU instructions in simulation. We see the two ALU input lines (x, y) multiplexed bus values depending on their control signals (x\_slc, y\_slc). The result of the operation, specified by the opcode (op) appears on the ALU output line (z):
+\begin{enumerate}[label=(\alph*)]
+    \item Multiplication
+    \item Left bitwise shift
+    \item Successful branch
+    \item Unsuccessful branch
+\end{enumerate}
+\begin{figure}[]
+  \centering
+  \subfloat[mul dst, imm : multiplying 0x5 and 0xa = 0x32]{\label{ref_label7}\includegraphics[width=0.8\textwidth]{mul_sim.JPG}}
+  \hfill{}
+  \subfloat[lsh dst, src : left shift of 0x2 by 0x2 = 0x8]{\label{ref_label8}\includegraphics[width=0.8\textwidth]{lsh_sim.JPG}}
+\hfill{}
+  \subfloat[jgt dst, imm : signalling branch on 0xac \textgreater 0xab]{\label{ref_label9}\includegraphics[width=0.8\textwidth]{jgt_ok.JPG}}
+  \hfill{}
+  \subfloat[jgt dst, imm : signalling branch on 0xac \textgreater 0xad]{\label{ref_label10}\includegraphics[width=0.8\textwidth]{jgt_fail.JPG}}
+\end{figure}
+
+\subsubsection{Control circuit}
+\begin{center}
+\includegraphics[scale=0.8]{fsm.pdf}\\
+\end{center}
+The control circuit is modelled as a deterministic finite state machine. The diagram depicts the state transitions, generalizing all instructions into a number of categories.\\\\
+The FSM is rather simple, which follows from the design. In particular, all instructions take a single clock cycle, including ones with main memory read/write. Normally, this would be platform-dependent. For example, in the current implementation we use coded register-based memory with synchronous (1 cycle) writes and asynchronous reads. The synthesizer maps this directly to Xilinx Distributed RAM [19]. When using an alternative platform, this might not be possible. For an instance, with a main memory read taking 2 clock cycle, a LOAD from main memory to a register would be a 3-cycle instruction: 2 for memory read + 1 for register write. We explore the implications of Distributed RAM usage further in later sections.\\\\
+Overall, the control circuit follows a 3-step pattern:
+\begin{enumerate}
+    \item Fetch - set signals for fetching an instruction. This concerns the IR and Instruction Store.
+    \item Execute - set signals for executing fetched instruction.
+    \item Increment - increment the PC.
+\end{enumerate}
+An \textbf{IDLE} state is used as a starting (post-reset) state which the circuit has in the very beginning of execution and normally does not enter later. Entering an IDLE state during execution would signalize a glitch.\\
+The \textbf{TRAP} state is essentially "terminated" and broadcasts "don't care" signals to all circuitry. It is entered when the filter program ends.\\
+An interesting state is \textbf{BRANCH}, where the circuit sets up the ALU for a branching comparison. The result is then fed back into the control circuit, which decides whether branching should be performed. A branch would essentially mean incrementing the PC explicitly and then immediately entering a \textbf{FETCH}. If no jump is performed, transition is as normal.
+
+\subsubsection{Decoder}
+\begin{center}
+\includegraphics[scale=1]{decod.pdf}\\
+\end{center}
+The decoder is perhaps the most simple module in the architecture. It essentially "slices" the instruction register line according to the eBPF encoding rules and "extracts" 5 different values:
+\begin{itemize}
+    \item \textbf{IMM} - This field occupies the 32 most significant bits of the instruction. The decoder \textbf{sign extends} it to 64 bit. This is done to avoid using a separate "bus width select" signal. By having a single 64-bit IMM bus, it can be connected to main memory, ALU and register bank, all of which use a 64-bit IMM input line. When working in a different memory mode, for example a word (32-bit) write, we just mask out the appropriate bits.
+    \item \textbf{OFF} - This 16-bit field is used to supply an offset value, used by the PC (jumps) and ALU (offset arithmetic). For the same reasons as the IMM, the OFF is also sign extended to 64 bits.
+    \item \textbf{SRC} - 4-bit field for decoding SRC register. Used by ALU and Register Bank.
+    \item \textbf{DST} - 4-bit field for decoding DST register. Used by ALU and Register Bank.
+    \item \textbf{OP} - 8-bit opcode. Used by the Control circuit and ALU.
+\end{itemize}
+
+\subsubsection{Instruction register}
+\begin{center}
+\includegraphics[scale=0.8]{ir.pdf}\\
+\end{center}
+The IR has a simple design to hold the current instruction, fetched from the instruction store at the PC offset.\\
+The current implementation uses a bi-directional bus, which is used to output the instruction on the bus, to the decoder when it is signalled "valid" by the control circuit. When not valid, it is set to high-impedance in order to load an instruction from the bus, coming from the instruction store.\\\\
+A bi-directional bus was used for an optimized design, which avoids extra wiring as data is never transmitted in both directions at the same time. In hardware, this is usually realized by a tri-state buffer.
+
+\subsubsection{Program counter}
+\begin{center}
+\includegraphics[scale=0.8]{pc.pdf}\\
+\end{center}
+The Program counter module is a 64-bit counter, which is updated in 3 ways depending on the signals broadcast from the control circuit:
+\begin{itemize}
+    \item Increment +1 : when incrementing to fetch the next instruction. This includes failed branching, which is ORed with the increment signal.
+    \item Increment +off : when doing a jump, either from a JA or a successful branch. This is signalled with the increment signal low and the branch signal asserted.
+    \item Load imm : a direct IMM load, which discards the previous counter value, as in a CALL instruction. However, the CALL instruction is intended for calling in-kernel routines at a host. Our hardware implementation does not support such calls and thus the instruction is currently considered a NOP. It is still implemented in the circuitry in case of future support.
+\end{itemize}
+
+\newpage
+\subsubsection{Register bank}
+\begin{center}
+\includegraphics[scale=0.8]{regbank.pdf}\\
+\end{center}
+The register bank contains all 10 available 64-bit registers. Writes are clocked, while reads are asynchronous. It has a single data input bus, which is multiplexed one of the following, depending on the instruction/state:
+\begin{enumerate}
+    \item \textbf{The ALU output} : All arithmetic, bit shifts and bit logic, which write to a DST register.
+    \item \textbf{The IMM field of the instruction} : The generic load instruction LDDW.
+    \item \textbf{The out data bus of the main memory block} : All memory load instructions, in different memory sizes.
+    \item \textbf{Data from the packet buffer} : All packet data load instructions, in different memory sizes.
+\end{enumerate}
+We also have 2 outbound buses, which use 2 address lines for decoding. Having these in parallel allows for ALU arithmetic on register values to be done in a single clock cycle. That is, an async fetch of the 2 values, async arithmetic and a single cycle for the write back to register.\\\\
+The support for 32-bit ALU instructions is achieved via bit mask blocks on the input and output buses. When doing 32-bit operations, we just enable these and end up using the 32-bit least significant "subregisters".\\
+Moreover, as per the eBPF specification, writebacks overwrite the previous value of the register. In summary, that means that reading 64-bit registers as if they are 32-bit simply masks off the most significant half, while writing overwrites the previous 64-bit value with the new 32-bit one and most significant half is NOT preserved.
+
+\subsubsection{Main memory}
+\begin{center}
+\includegraphics[scale=0.8]{ram.pdf}\\
+\end{center}
+The circuit's main memory is currently coded as an array of registers. Size and depth is defined by preprocessor directives.\\
+There is a single output bus, which is multiplexed into the Register Bank. The \textbf{address} line specifies the location of both reads and writes, while \textbf{length} specifies the size of the read/write. Writes are done at a rising edge, when the \textbf{r/w} signal is asserted by the control circuit.\\
+The data going into memory is either a register value or an immediate specified value.\\\\
+The implementation works with asynchronous reads and 1 clock cycle synchronous writes. This maps to Xilinx Distributed RAM [19], which is essentially an array of Look-up tables.\\
+Using that, we manage to achieve 1 clock cycle execution for all memory instructions by utilizing the asynchronous reading.\\
+However, in most modern architectures, memory reads are either 1 or 2 clock cycles. With a register write being 1 clock cycle, that adds up to 2, or 3, cycles in total for a memory read into a register. That is, a memory LOAD instruction. Thus, we can argue that using conventional RAM would slow down filter execution. We investigate by how much in the Evaluation chapter.\\\\
+It is important to note that Distributed RAM is intended for very small data sets and using it for general-purpose main memory could have negative implications.\\
+When synthesizing a Distributed RAM blocks, available LUTs are grouped together and large multiplexers are also synthesized. This results in very long synthesis times and bad utilization.\\\\
+When trying to synthesize a \textbf{128 bytes} block of Distributed RAM for the Virtex-5 in the Xilinx ISE, the synthesizer infers \textbf{1024 D-type flip-flops} and \textbf{120 multiplexers}. This is followed by a warning:\\
+\includegraphics[scale=0.8]{resourcewarning.JPG}\\
+This shows that Distributed RAM would not be suitable for buffering packets on a Virtex-5.\\
+In terms of main memory and instruction store usage, suitability would depend on the filter program deployed: its length in instructions and usage of memory operations.
+
+\subsubsection{Instruction store}
+The instruction store module in the current implementation is a hard-coded ROM "stub". It is asynchronous and broadcasts a 64-bit instruction upon change of address.\\
+When synthesized for real hardware, it maps to Xilinx Distributed RAM. As discussed in the Main memory section, the usage of such scheme in a real implementation would depend on the filter deployed.\\
+This is useful for testing purposes and can still be deployed, assuming that the filter code will not be changed. In a real implementation, the instruction store would ideally be a double-ported RAM block, with a port designated for reading (simulated ROM). It might be desirable to deploy filters on the fly by supplying byte code, which would involve flushing the store and resetting the circuitry with the new filter code.\\\\
+In the current implementation, In order to manually swap the filter byte code, we simply extend/shrink the "address map" with the number of instructions in the new filter and hard-code the 64-bit values. This requires re-synthesis.
+
+\subsubsection{Packet buffer}
+The packet buffer implementation is, for all intents and purposes, a stub.\\
+A major challenge in the project was adapting the NetFPGA platform pipeline with the proposed soft core. Packet buffering at network interfaces is done by the platform into RAM blocks and it is hard to predict how that would be used by the soft core. A discussion of the topic is dedicated in the Hardware deployment and future work chapter.\\\\
+In the current implementation, we utilize a coded memory block, in which packet data is buffered and can be accessed just like main memory: async reads. This works in a simulator. However, as discussed in the Main memory section, this scheme would be impossible on a Virtex-5 as a Distributed RAM block is restricted in size.\\
+Similarly to the instruction store, for the purpose of testing and simulation, packet data is currently hard coded and can only be changed via re-synthesis.\\\\
+Data is latched out asynchronously, multiplexed into the Register Bank (LOAD\_ABS/LOAD\_IND). Addressing and byte count is signalled by the control circuit.\\
+The module is also clocked for the purposes of writing to inside memory, but currently no implementation of a packet stream exists, so writes are never performed.
+\newpage
+\subsection{Simulating the implementation}
+Following the implementation of each described module in Verilog, a test bench was constructed to test and verify the full design working. A major point for testing was the correct working of the state machine. Additionally, branching operations and jumping.\\\\
+The following figure shows a snapshot of the test bench being used for testing a branching operator in \textbf{Icarus Verilog}.\\\\
+The code in execution is the following short filter:
+\begin{lstlisting}[language=ebpfAsm]
+  loadw r1, #2
+  jeq r1, #2, lb  
+  loadw r4, #2
+lb:exit
+\end{lstlisting}
+\begin{center}
+\includegraphics[scale=0.6]{simscreenfinal.JPG}\\
+\end{center}
+We observe the following internal circuit signals:
+\begin{itemize}
+    \item op        : opcode of current instruction
+    \item instr\_addr: instruction address of current instruction
+    \item src\_bus   : value on the src bus out of the Register Bank
+    \item dst\_bus   : value on the dst bus out of the Register Bank
+    \item alu\_out   : value out of the ALU
+    \item reg\_1     : value in register R1
+    \item src\_ctl   : control signal
+    \item dst\_ctl   : control signal
+\end{itemize}
+At time \textbf{20}, the circuit successfully loads constant value 0x2 into R1.\\
+At time \textbf{52}, the circuit has successfully performed a jump, incrementing \textbf{pc + 2}. Thus, it executes an \textbf{EXIT}, which puts the circuit into a \textbf{TRAP} state.
+
+\newpage
+\subsection{Hardware deployment}
+Our design was shown to work as a behavioural model in a simulated environment. This showed that the proposed architecture and design are functional as far as the required instruction set. However, real hardware deployment would involve full synthesis of the design and thorough testing in order to avoid bugs and glitches. Moreover, the results of synthesis for the FPGA fabric require close examination to identify possible optimisations.\\
+The final phase of the project involved researching how a hardware-synthesizable model would be deployed on the NetFPGA platform.
+
+\subsubsection{Replacing the NetFPGA pipeline}
+\begin{center}
+\includegraphics[scale=0.8]{netfpgapipe.PNG}\\
+\end{center}
+The generic NetFPGA-10G pipeline involves 3 main stages once a packet arrives at a network interface [12].
+\begin{enumerate}
+    \item The \textbf{Input Arbiter} is connected to 5 RX queues, one for each port interface module and one for the DMA module. These are small fall-through FIFO structures which have packets enqueued as they arive on the different device ports.\\
+    The arbiter copies packets over from each queue in a round-robin manner.
+    \item \textbf{Output Port Lookup} involves deciding which port a packet goes out of. This is the de-facto decision module, which is the main point of interest when it comes to filtering packets.\\
+    Normally, at this stage, all packets are sent over to the CPU and back around based on the packet header.
+    \item The \textbf{BRAM Output Queues} accept packets which have already been "marked" with their destination, following the previous stage. Depending on the destination, the packet enters a designated queue. There are 5 output queues, one for each 10G port and one for the DMA module.
+\end{enumerate}
+Our proposed soft core can be looked at as a decision module. As explained in previous chapters, it essentially processes a packet and decides on whether it should be kept or dropped.\\
+Thus, it fits in the pipeline as a replacement for the current "Output Port Lookup" module. Essentially, an output port decision is made by the eBPF filter returning a given value. For example, the following filter code would result in marking the packet to be forwarded to port number 4:
+\begin{lstlisting}[language=ebpfAsm]
+  ...
+  ret #4
+\end{lstlisting}
+However, in order to fully implement filtering, a way to utilize CPU communication would need to be explored.\\
+In particular, designating a packet for an outbound queue would involve marking it with a port number, depending on the filter \textbf{ret} value, while dropping it would involve raising a \textbf{DROP\_PACKET} line.\\
+Logic still needs to be implemented for cases when the filter is unsure of what to do and needs to consult an external processing unit. In these cases, the CPU would be consulted to make a decision.
+
+
+\chapter{Evaluation}
+\section{Device Utilization}
+We first examine how space-demanding our design is on the Virtex-5 FPGA. This is done by synthesizing the processing part of our design.
+We omit memory modules: \textbf{instruction store}, \textbf{main memory} and \textbf{packet buffer} as these would be "external" in a real hardware implementation. That is, they would use available memory resources rather than the FPGA logic fabric. As explained in the previous chapter, they are currently hard coded stubs in our test implementation.\\\\
+The following data is gathered using the \textbf{XST} synthesis tool in the \textbf{Xilinx ISE}. In particular, we examine global buffers (BUFGs), DSPs and slices, which are the "rough" building block of the fabric. In the Virtex-5, each slice contains 4 LUTs and 4 registers [20]:
+\begin{center}
+\begin{tabular}{ |c|c|c|c|c|c| } 
+ \hline
+ \textbf{Module} & \textbf{Slice registers} & \textbf{Slice LUTs} & \textbf{Occupied slices} & \textbf{BUFG/CTRLs} & \textbf{DSP48Es slice} \\ 
+ \hline
+   Control Unit & 29 & 74 & 34 & 1 & 0\\
+   ALU & 0 & 1096 & 409 & 0 & 9\\
+   Decoder & 0 & 0 & 0 & 0 & 0\\
+   IR & 0 & 0 & 0 & 1 & 0\\
+   PC & 32 & 64 & 18 & 1 & 0\\
+   Register Bank & 832 & 1005 & 567 & 1  & 0\\
+   \hline
+   Device utilization & 0.596\% & 1.495\% & 2.746\% & 12.5\% & 9.375\%\\
+ \hline
+\end{tabular}\\
+\end{center}
+The above provides a useful estimate on the design's scale.\\
+In particular, we observe that the most utilized type are global buffers, which distribute high fanout signals throughout a device [21].\\
+This data can be used to estimate the amount of processing cores that can be deployed on a single Virtex-5 FPGA. Provided all designs synthesize the same and no extra resources are used, we could be able to deploy a maximum of 8 such soft cores, with a total global buffer utilization of 100\%.\\\\
+Note that the above data is simply a rough estimate. Device utilization depends on a range of factors, including synthesizer used, HDL constructs, optimization levels and intermodule wiring amongst others. Thus, there are no guarantees that we could replicate the exact same results on a superscaled implementation. However, the critical points (DSPs, BUFGs) are expected to stay constant.\\
+Moreover, we do not consider external resources, such as memory blocks.
+
+\section{Packet processing}
+We now evaluate the proposed soft core architecture by looking at packet processing performance in a 10G network. In particular, we examine the clock speed required in order to match different traffic and achieve line-rate processing with a constant-size filter program. We look at how an alternative architecture, in terms of RAM blocks used, would perform compared to the currently proposed one.\\
+Moreover, we examine the effects of superscaling our architecture on the performance estimates.\\
+Finally, we give estimates on the number of instructions a filter could have while processing at line rate at different frequencies.\\\\
+For part of the evaluation, we will use a constant-size realistic filter program, which is the example presented in the \textbf{BPF filtering} section, translated into eBPF. It matches a DNS query to "www.example.com". It is a good example of a type of filter which is used in the field and could realistically run on our architecture:
+\begin{lstlisting}[language=ebpfAsm]
+    ; load 0x20 into R1
+    lddw r1, #0x20
+    ; load packet data
+    ldabsb r0, r0, #0x0
+    and r0, #0xf
+    lsh r0, #2
+    ; R1 = (lowest nibble of packet << 2) + 0x20
+    add r1, r0
+    
+lb0:
+    ; Match: 076578616d706c6503636f6d00
+    ldind r1, r2, #0x0
+    jne r2, #0x07657861, lb1
+    ldind r1, r2, #0x4
+    jne r2, #0x6d706c65, lb1
+    ldind r1, r2, #0x8
+    jne r2, #0x03636f6d, lb1
+    ldind r1, r2, #0x12
+    jne r2, #0x00, lb1
+    
+    ; drop
+    lddw r0, #0x1
+    exit
+    
+lb1:
+    lddw r0, #0x0
+    exit
+\end{lstlisting}
+The filter program contains 17 instructions in total. That is, 15 instructions maximum in a critical path due to the 2 points of exit. 5 instructions involve packet access (LD\_ABS, LD\_IND).\\
+With the current implementation of the packet buffer in Distributed RAM, packet data reads are accomplished in a single cycle. This makes the whole filter program have a critical path of \textbf{15 cycles}.\\
+With a standard RAM implementation, packet data reads would take 2 clock cycles. Having 5 such instructions in the critical path, this bumps up the critical path execution to \textbf{25 cycles}.\\\\
+Another factor in achieving line-rate filtering is the FPGA clock frequency. The NetFPGA-10G uses a Virtex-5 chip, which is rated with a "theoretical frequency maximum" of 550 MHz. However, in practice the device is easily, and usually, clocked at 200 MHz or 100 MHz.
+
+\subsection{Worst case traffic}
+We now evaluate our architecture in the context of worst case 10G traffic. That is, constant flow of minimum size packets.\\\\
+We compute the minimum size of a packet as follows:
+\begin{lstlisting}
+  Ethernet-specific:
+    12 bytes : inter-frame gap
+    8  bytes : MAC preamble
+  Ethernet frame:
+    14 bytes : MAC header
+    46 bytes : Minimum payload size
+    4  bytes : Ethernet CRC
+    
+  Minimum size = 12 + 8 + 14 + 46 + 4 = 84 bytes
+\end{lstlisting}
+In a "worst case" scenario, the filtering will have to deal with a constant flow of minimum size packets. In a 10G network, that is:\\\\
+\large{\((10 * 10^9) bits/sec / (84 bytes * 8) = 14,880,952\)}\\\\
+In other words, the filtering unit needs to "service" almost 15 million packets per second.
+\subsubsection{Single processing unit}
+Considering the critical paths of the 2 different soft core architectures explained above, we observe the following capabilities at different FPGA clock frequencies:
+\begin{center}
+\begin{tabular}{ |c|c|c| } 
+ \hline
+ \textbf{Crit. path length} & \textbf{Clock freq.} & \textbf{Packets serviced / sec} \\ 
+ \hline
+   15 & 550 MHz & 36,666,666\\
+   15 & 200 MHz & 13,333,333\\
+   15 & 100 MHz & 6,666,666\\
+   25 & 550 MHz & 22,000,000\\
+   25 & 200 MHz & 8,000,000\\
+   25 & 100 MHz & 4,000,000\\
+   \hline
+    & & 14,880,952\\
+ \hline
+\end{tabular}\\
+\end{center}
+Thus, we predict all frequencies failing to match the incoming traffic at line-rate, except for the 550 MHz theoretical maximum. This is observed in both of the critical path variations.\\\\
+We can easily calculate the exact clock frequency needed to match the worst case traffic. From the charts and tabular data, that clock would be slightly faster than 200 MHz for the 15 cycles long critical path, and between 200 MHz and 550 MHz for the 25 cycles long critical path.
+\begin{equation}
+ \frac{x \times 1M}{15} \geq 14,880,952\nonumber
+\end{equation}
+\begin{equation}
+ x \geq \frac{15 \times 14,880,952}{1M}\nonumber
+\end{equation}
+\begin{equation}
+ x \geq 223.214...\nonumber
+\end{equation}
+Thus, a clock frequency of 223.3 MHz would be enough to match worst case traffic with the filtering done by a soft core with asynchronous memory reads (Distributed RAM).\\\\
+Similarly for the standard RAM critical path:
+\begin{equation}
+ \frac{x \times 1M}{25} \geq 14,880,952\nonumber
+\end{equation}
+\begin{equation}
+ x \geq \frac{25 \times 14,880,952}{1M}\nonumber
+\end{equation}
+\begin{equation}
+ x \geq 372.024...\nonumber
+\end{equation}
+Thus, a clock frequency of 372.1 MHz is needed to match worst case traffic. This is below the theoretical maximum of 550 MHz.
+
+\subsubsection{Superscaled processing}
+We now examine clock frequency demands on a superscaled architecture. As discussed in the \textbf{Device Utilization} section, we can estimate a maximum of 8 processing units deployed on a Virtex-5 with maximum device utilization.\\\\
+The following chart shows the amount of packets per second that an FPGA can handle given a clock speed and amount of processing cores deployed. In particular, we look at the frequencies that failed to match a worst case traffic using a filter of 25 critical path:\\
+\includegraphics[scale=0.83]{superscalednew.JPG}\\
+This shows that an FPGA clocked at 100 MHz or 200 MHz can still be optimized to match worst case traffic by superscaling the processing units to 4 or 2 respectively.\\
+What is more, the device utilization analysis done in the previous section showed that it can be easily achieved as both numbers are far from the maximum of 8.
+
+\subsubsection{Non-constant filter size}
+Additionally, we can plot the time demand per packet to be serviced at line rate and the length of a filter. This way, we can see how long of a filter program each frequency allows while sustaining line rates.\\
+For a clocked device to be able to deal with packets at line rate, its time demand per packet needs to be "below" that of the packet interrarival time. Thus, as long as its line on the chart is "below" that of the traffic, it can process traffic at line rate.\\
+\includegraphics[scale=0.8]{latesteval.JPG}\\
+We observe that a device clocked at 200 MHz would struggle to sustain line rate processing against worst-case traffic, using a filter of more than 10 instructions in its critical path.\\
+Moreover, a device clocked at 100 MHz can only execute up to 5 instructions and preserve line rate.\\\\
+Since we aim to implement an architecture to deal with worst case scenarios, it is interesting to investigate how superscaling would change the above conclusions. We can simply use multiplication on the results.\\\\
+For a 100 MHz device:\\
+\begin{equation}
+ 5 \text{ instructions} \times 8 \text{ units} = 40 \text{ instructions max}\nonumber
+\end{equation}
+For a 200 MHz device:\\
+\begin{equation}
+ 10 \text{ instructions} \times 8 \text{ units} = 80 \text{ instructions max}\nonumber\\\\
+\end{equation}
+Note that these predictions assume a filter program critical path to be equal to the number of instructions. That is, all instructions are in 1 clock cycle. This corresponds to our current proposed design with Distributed RAM memory.
+
+%
+%\subsection{Maximum sized packets}
+%The opposite extreme case in terms of traffic would be packets of maximum size coming in. In other words, considering the same line bandwidth, we would want to examine how the soft core architecture handles a minimum amount of packets arriving each time unit. That is, with a maximum inter-packet arrival time time.\\\\
+%A maximum size is computed as follows:
+%\begin{lstlisting}
+%  Ethernet-specific:
+%    12 bytes    : inter-frame gap
+%    8  bytes    : MAC preamble
+%  Ethernet frame:
+%    14 bytes    : MAC header
+%    1500 bytes  : Maximum payload size
+%    4  bytes    : Ethernet CRC
+%    
+%  Maximum size = 12 + 8 + 14 + 1500 + 4 = 1538 bytes
+%\end{lstlisting}
+%As explained above, in our "best case" scenario, there is a constant flow of maximum size packets. In a 10G network, that is:
+%\begin{equation}
+% (10 \times 10^9) \text{ bits / sec } / (1538 \text{ bytes } \times 8) = 812,744\nonumber
+%\end{equation}
+%Considering the critical paths of the 2 different soft core architectures, we observe the following capabilities at different FPGA clock frequencies:
+%\begin{center}
+%\begin{tabular}{ |c|c|c| } 
+% \hline
+% \textbf{Crit. path length} & \textbf{Clock freq.} & \textbf{Packets serviced / sec} \\ 
+% \hline
+%   16 & 550 MHz & 34,375,000\\
+%   16 & 200 MHz & 12,500,000\\
+%   16 & 100 MHz & 6,250,000\\
+%   21 & 550 MHz & 26,190,476\\
+%   21 & 200 MHz & 9,523,809\\
+%   21 & 100 MHz & 4,761,905\\
+%   \hline
+%    & & 812,744\\
+% \hline
+%\end{tabular}\\
+%\end{center}
+%Thus, we can predict that an FPGA clocked at %all the above frequencies will easily match a traffic of maximum sized packets and will process them at line rate. This holds for both critical path variations.\\
+%In that case, we do not need to consider superscaling the processing unit.
+
+%\subsubsection{Non-constant filter size}
+%We now plot the time demand per packet to be serviced at line rate and the length of a filter. This way, we can see how long of a filter program each frequency allows while sustaining line rates.\\
+%For a clocked device to be able to deal with packets at line rate, its time demand per packet needs to be "below" that of the inter-packet arrival time. Thus, as long as its line on the chart is "below" that of the traffic, it can process traffic at line rate.\\
+%\includegraphics[scale=0.8]{latestevalbest.JPG}\\
+%The chart shows that the 200 MHz clocked device deals with traffic at line rate for up to 245 instructions on the critical path.\\
+%The 100 MHz clocked device can do processing with up to 123 instructions on the filter critical path.\\ 
+%Note that these predictions assume a filter program critical path to be equal to the number of instructions. That is, all instructions are in 1 clock cycle. This corresponds to our current proposed design with Distributed RAM memory.
+
+\subsection{A realistic example}
+The worst case evaluated above demonstrated an extreme of network traffic. While it is crucial to evaluate a design in such context, we now also evaluate the filtering performance on a real network's  traffic.\\
+We use a short packet trace (5 seconds) from a backbone link (caida):\\
+\begin{center}
+\includegraphics[scale=0.33]{caida3.pdf}\\
+\end{center}
+We observe a maximum burst of 542 packets per milisecond.\\
+Now we analyze how our proposed architecture would deal with traffic exhibiting the same burst.\\
+\begin{center}
+\includegraphics[scale=0.8]{wiresharkpps.JPG}\\
+\end{center}
+The device clocked at 100 MHz manages to process at line rate with a filter critical path of 184 instructions, while to 200 MHz device goes up to 369 instructions.\\
+This gives a comfortable window for standard simple filters, such as the "www.example.com" DNS query example.\\\\
+To push our design's performance further on this real world example, we can examine the effect of superscaling our processing to 8 units on the same device. That is, we can multiply the results from the above data plot by 8:\\
+\begin{itemize}
+    \item 100 MHz clocked device: max 1472 instructions
+    \item 200 MHz clocked device: max 2952 instructions
+\end{itemize}
+This is still below the maximum allowed by the in-kernel BPF implementation, which is 4096. However, it is enough to allow standard filters.
+
+\chapter{Conclusion}
+\section{Reflection}
+In this project, we investigated a feasible hardware implementation of the extended Berkeley Packet Filter (eBPF) which could be deployed on a real networked device, such as the NetFPGA-10G. The goal being line-rate processing of packets using a fast and platform-independent architecture. Our research presents a stable first step into building a standalone implementation, which needs further extensions and refinement into a fully-functional hardware platform.\\\\
+We proposed a soft core architecture, which implements the eBPF instruction set and executes all classes of instructions in a single clock cycle, utilizing Xilinx Distributed RAM. The design was tested functional in a fully simulated environment.\\\\
+Firstly, The processing core of our design was shown to be synthesizable up to 8 times on a single Virtex-5 FPGA, which is the on-board chip of the NetFPGA-10G. This indicates the possibility of superscaling our design to achieve better packet filtering rates.\\\\
+The design was first shown to execute a constant-sized realistic filter at line rate in worst-case traffic provided a clock frequency of 372.1 MHz.\\
+Secondly, it was shown to match line rate in worst-case traffic with a filter of up to 10 instructions critical path at a standard clock rate of 200 MHz.\\
+We further investigated the impact of superscaling our design to 8 processing units. This led to a maximum filter critical path of 80 instructions to achieve line-rate processing against worst-case traffic at a standard clock rate of 200 MHz.\\\\
+Our architecture was also evaluated in the context of realistic traffic, using a trace from a backbone link. This showed a maximum filter critical path of 369 instructions at the maximum traffic burst, provided a standard 200 MHz clock. That is, 2952 instructions with superscaling to 8 processing units.\\\\
+Considering worst-case traffic, we can conclude that our architecture can successfully execute standard filters with up to 80 instructions critical paths on a NetFPGA-10G device. However, this implies superscaling the processing unit.
+
+\section{Future work}
+A major advantage of our design is the usage of Distributed RAM asynchronous reads, which leads to single clock cycle instructions. However, the feasibility of using this construct for all types of memory needs further investigating concerning memory sizes and FPGA deployment devices.\\\\
+As shown in the "Main memory" section, we were not able to successfully synthesize 128 bytes of Distributed RAM memory, which eliminates the option of buffering packets into Distributed RAM.
+Secondly, implementing the pipeline replacement, would be the next logical step in realising this project once the memory scheme is refined.\\\\
+As described in the "Hardware deployment" section, the NetFPGA-10G source contains 3 separate modules, each corresponding to the 3 stages of the pipeline. Given a hardware-synthesizable, fully-compliant implementation of our proposed soft core, it would need to be adapted to interface with the \textbf{Input Arbiter} and \textbf{BRAM Output Queues}. Moreover, it would need to implement some of the logic of the \textbf{Output Port Lookup} in order to replace it. This includes designating packets and possibly offloading decisions to the CPU.\\\\
+In practice, the NetFPGA-10G is a volatile platform and these changes would require thorough testing both in simulation and deployment. Additionally, further investigation is needed into the exact required changes to the NetFPGA-10G pipeline.\\\\
+
+\begin{center}
+\LARGE{\textbf{Acknowledgements}}
+\end{center}
+I wish to thank Dr Dimitrios Pezaros and Simon Jouet of the University of Glasgow School of Computing Science for the consistent help and support during my work on this project.
+
+%%%%%%%%%%%%%%%%%%%%
+%   BIBLIOGRAPHY   %
+%%%%%%%%%%%%%%%%%%%%
+%\nocite{*}
+\bibliography{refs}
+\bibliographystyle{plain}
+\begin{enumerate}[label={[\arabic*]}]
+\item S. McCanne, V. Jacobson. "The BSD Packet Filter: A New Architecture for User-level Packet Capture". 1993 Winter USENIX Conference.\\
+Available at http://www.tcpdump.org/papers/bpf-usenix93.pdf. Retrieved February 13, 2017.
+\item M. Majkowski. "BPF - the forgotten bytecode". May 21, 2014.\\
+Available at https://blog.cloudflare.com/bpf-the-forgotten-bytecode/. Retrieved February 1, 2017.
+\item S. Jouet, R. Cziva, D. P. Pezaros. "Arbitrary Packet Matching in OpenFlow". 
+\item S. Jouet, D. P. Pezaros. "BPFabic: Data Plane Programmability for Software Defined Networks", 2017
+\item J. Schulist, D. Borkmann, A. Starovoitov. "Linux Socket Filtering aka Berkeley Packet Filter".\\
+Avaialble at https://www.kernel.org/doc/Documentation/networking/filter.txt. Retrieved February 1, 2017.
+\item "Linux kernel 3.19, Section 11. Networking". February 8, 2015.\\
+Available at kernelnewbies.org. Retrieved February 13, 2015.
+\item J. Corbet. "Attaching eBPF programs to sockets". December 10, 2014.\\
+Available at LWN.net. Retrieved February 13, 2015.
+\item "Linux kernel 4.1, Section 11. Networking". June 21, 2015.\\
+Available at kernelnewbies.org. Retrieved October 17, 2015.
+\item J. Corbet. "Extending extended BPF". July 2, 2014.\\
+Available at LWN.net. Retrieved January 19, 2015.
+\item J. Corbet. "The BPF system call API, version 14". September 24, 2014\\
+Available at LWN.net. Retrieved January 19, 2015.
+\item "Linux kernel 3.18, Section 1.3. bpf() syscall for eBFP virtual machine programs".\\
+Available at kernelnewbies.org. December 7, 2014. Retrieved January 19, 2015.
+\item NetFPGA official github. "NetFPGA 10G Reference pipeline".\\
+Available at https://github.com/NetFPGA/NetFPGA-public/wiki/NetFPGA-10G-Reference-pipeline. Retrieved March 2, 2017.
+\item NetFPGA official github.
+Available at https://github.com/NetFPGA. Retrieved March 2, 2017.
+\item I. Vassányi. "Implementing processor arrays on FPGAs". In: Hartenstein R.W., Keevallik A. (eds) Field-Programmable Logic and Applications From FPGAs to Computing Paradigm. FPL 1998. Lecture Notes in Computer Science, vol 1482. Springer, Berlin, Heidelberg
+\item Z. Wang, O. Hammami. "A 24 Processors System on Chip FPGA Design with Network on Chip". ENSTA ParisTech Paris, France.\\
+Available at https://www.design-reuse.com/articles/21583/processor-noc-fpga.html. Retrieved January 11, 2017.
+\item N. Kaur, A. Kumar, L. Gupta. "VHDL Design and Synthesis of 64 bit RISC Processor System on a Chip (SoC)". IOSR Journal of VLSI and Signal Processing. Volume 3. 2013
+\item J. Gray. "Building a RISC CPU and System-on-a-Chip in an FPGA". Circuit Cellar. 2000
+\item R. Kruger. "Reality TV for FPGA design engineers". EE Times. 2006.
+\item Xilinx User Guides. "7 Series FPGAs Configurable Logic Block". User Guide. September 27, 2016.
+Available at http://www.eetimes.com/document.asp?doc\_id=1274495\&page\_number=2. Retrieved January 10, 2017.
+\item National Instruments Manuals. LabVIEW 2011 FPGA Module Help. "Introduction to FPGA Hardware Concepts (FPGA Module)". June 2011.\\
+Available at http://zone.ni.com/reference/en-XX/help/371599G-01/lvfpgaconcepts/fpga\_basic\_chip\_terms/. Retrieved March 13, 2017.
+\item Xilinx ISE Help. "Global Buffers".\\
+Available at https://www.xilinx.com/itp/xilinx10/isehelp/ise\_r\_comp\_global\_buffers.htm. Retrieved March 13, 2017.
+
+
+\end{enumerate}
+\end{document}
+

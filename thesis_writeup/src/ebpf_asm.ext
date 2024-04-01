@@ -1,0 +1,43 @@
+% Define Language
+\lstdefinelanguage{ebpfAsm}
+{
+  % list of keywords
+  morekeywords={
+    add,
+    sub,
+    mul,
+    div,
+    or,
+    and,
+    lsh,
+    rsh,
+    neg,
+    mod,
+    xor,
+    mov,
+    arsh,
+    add32,
+    sub32,
+    mul32,
+    div32,
+    or32,
+    and32,
+    lsh32,
+    rsh32,
+    neg32,
+    mod32,
+    xor32,
+    mov32,
+    arsh32,
+    le16,
+    le32,
+    le64,
+    be16,
+    be32,
+    be64
+  },
+  sensitive=false, % keywords are not case-sensitive
+  morecomment=[l]{//}, % l is for line comment
+  morecomment=[s]{/*}{*/}, % s is for start and end delimiter
+  morestring=[b]" % defines that strings are enclosed in double quotes
+}

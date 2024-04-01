@@ -31,5 +31,9 @@
 *.out
 *.app
 
+# Custom
+.vscode
+.DS_Store
+ebpf_emulator/src/build
 *~
 *#

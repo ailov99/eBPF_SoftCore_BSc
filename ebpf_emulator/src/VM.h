@@ -2,7 +2,7 @@
 
 #include <cstdint>
 #include <vector>
-#include "Registers.h"
+#include "Register.h"
 
 #define NUM_REGS 10
 #define NUM_MEMSLOTS 16
@@ -53,7 +53,7 @@ private:
   
 public:
   VM();
-  uint64_t Run(const std::vector<uint64_t>&);
+  uint64_t Run(const std::vector<uint64_t>&, int up_to=15);
   bool IsRunning() const;
   void DisplayRegs() const;
   void DisplayState() const;

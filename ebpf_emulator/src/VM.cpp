@@ -712,10 +712,11 @@ void VM::DisplayAll() const
 
 // "main" run routine for the VM
 // Kicks off the Fetch->Decode->Eval
-uint64_t VM::Run(const std::vector<uint64_t>& program)
+uint64_t VM::Run(const std::vector<uint64_t>& program, int up_to)
 {
   running = true;
   
+  auto cycles{0};
   while (IsRunning())
   {
     // display register contents
@@ -732,6 +733,11 @@ uint64_t VM::Run(const std::vector<uint64_t>& program)
     {
       // program returned -> ret value is in R0
       running = false;
+    }
+
+    // Early exit - for debugging
+    if (++cycles >= up_to) {
+      break;
     }
   }
   

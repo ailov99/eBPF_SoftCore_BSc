@@ -2,7 +2,13 @@ This is an emulator that can execute simple eBPF programs and was written to hel
 
 ## To run
 
-TODO
+* cd src
+* mkdir build && cd build
+* cmake ..
+* make
+* ./main
+
+**Note**: eBPF source is currently hard-coded in main() to "basic.bpf"
 
 ## Architecture
 

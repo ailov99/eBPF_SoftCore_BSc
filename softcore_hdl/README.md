@@ -2,7 +2,7 @@ This is the HDL IP design for the eBPF soft core.
 
 ## To run
 
-TODO
+This project was originally developed using the [Icarus](https://steveicarus.github.io/iverilog/) compiler and simulator. Since it's a rather simple design, it should be compile-able and simulate-able with a tool of one's choice, pointing to **driver.v** as the simulation entry point.
 
 ## Architecture
 

@@ -7,8 +7,6 @@ The aim was to develop a proof-of-concept soft core processor, based on [eBPF](h
 The project consists of 3 parts:
 * An eBPF emulator - this can execute simple eBPF programs and was written to help with learning the instruction set. It is a higher-level description of a soft core. This was originally developed in Netbeans on Linux.
 * Soft Core IP - the HDL (Verilog) for the soft core processor. This was initially developed using Icarus Verilog on Linux. Then synthesized and analyzed using Vivado.
-* The writeup - this covers the writeup of the thesis.
-
-I will be periodically updating this repository as I try to get the emulator and HDL running on a modern system, providing instructions as I go.
+* The writeup - this contains the final version of the thesis as PDF.
 
 **Note:** Currently, there is no plan to look into improving/optimizing the source code. It will be left as written 7+ years ago.

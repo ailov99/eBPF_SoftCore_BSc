@@ -1,0 +1,14 @@
+    ; load constants into registers
+    lddw r2, #0x4
+    lddw r3, #0x6
+    lddw r4, #0xa
+    
+    ; 0x4 + 0x6 = 0xa
+    add r2, r3
+    jeq r2, r4, success
+    
+    ; drop packet
+    ret #1
+
+success:
+    ret #0

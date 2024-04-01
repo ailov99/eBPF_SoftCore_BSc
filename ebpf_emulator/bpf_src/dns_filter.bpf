@@ -1,0 +1,28 @@
+    ; load 0x20 into R1
+    lddw r1 , #0x20
+
+    ; load packet data
+    ldabsb r0 , r0 , #0x0
+    and r0 , #0xf
+    lsh r0 , #2
+    ; R1 = (lowest nibble of packet << 2) + 0x20 
+    add r1 , r0
+
+lb0 :
+    ; Match : 076578616d706c6503636f6d00 (www.example.com)
+    ldind r1 , r2 , #0x0
+    jne r2 , #0x07657861 , lb1
+    ldind r1 , r2 , #0x4
+    jne r2 , #0x6d706c65 , lb1
+    ldind r1 , r2 , #0x8
+    jne r2 , #0x03636f6d , lb1
+    ldind r1 , r2 , #0x12
+    jne r2 , #0x00 , lb1
+
+    ; drop
+    lddw r0 , #0x1
+    exit
+
+lb1 :
+    lddw r0 , #0x0
+    exit
